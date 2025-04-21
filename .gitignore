@@ -1,0 +1,28 @@
+# Credenciales y Tokens Secretos de Google
+credentials.json
+token.json
+
+# Entorno Virtual (si usas uno como venv)
+venv/
+*.venv/
+env/
+
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos de log (si generas alguno)
+*.log
+
+# Archivos de configuración de IDEs (ejemplos)
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?venv/
+
+credentials.json
+token.json
