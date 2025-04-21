@@ -2,14 +2,14 @@ import os.path
 import base64
 import re # Para expresiones regulares (extraer datos)
 import logging # Para registrar información y errores
+import html2text # Para convertir HTML a texto
+import datetime # Para obtener el año actual si falla la extracción del header
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
-import html2text
 
 # --- CONFIGURACIÓN ---
 # Si modificas estos SCOPES, elimina el archivo token.json.
@@ -22,13 +22,16 @@ SPREADSHEET_ID = '19DMRr2n_Xc7YF_9nKzpNaobgKw_s4fGWhmfJCPzIYNo'
 # Nombre de la hoja + rango donde añadir datos. 'A1' asume columnas Fecha, Banco, Comercio, Tarjeta, Importe
 SHEET_RANGE_NAME = 'Cuentas' 
 
-GMAIL_LABEL_TO_SEARCH = 'tarjetas-consumos-tarjeta' # Etiqueta de donde leer
+GMAIL_LABEL_TO_SEARCH = 'tarjetas-consumos-tarjeta' # Etiqueta de donde leer (formato para API/búsqueda)
 PROCESSED_LABEL_NAME = 'Procesado' # Etiqueta para marcar correos leídos
 CREDENTIALS_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
 
+# Mapa de meses abreviados a números (para Naranja X)
+MESES_MAP = {'ENE': '01', 'FEB': '02', 'MAR': '03', 'ABR': '04', 'MAY': '05', 'JUN': '06', 'JUL': '07', 'AGO': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DIC': '12'}
+
 # Configuración de logging (cambiar a DEBUG para más detalle)
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
 
 # --- FUNCIONES AUXILIARES ---
 
@@ -127,6 +130,7 @@ def extract_data_from_email(message):
     subject = ''
     sender = ''
     body_text = ''
+    email_year = None # Para guardar el año extraído del header
 
     payload = message.get('payload', {})
     if not payload:
@@ -136,208 +140,248 @@ def extract_data_from_email(message):
     headers = payload.get('headers', [])
     logging.debug(f"Mensaje {msg_id} - Payload MimeType: {payload.get('mimeType')}")
 
-    # Extraer Asunto y Remitente
+    # --- Extracción de Headers Clave (Remitente, Asunto, Fecha) ---
     for header in headers:
         name = header.get('name', '').lower()
         value = header.get('value', '')
         if name == 'subject':
             subject = value
             logging.debug(f"Mensaje {msg_id} - Asunto: {subject}")
-        if name == 'from':
+        elif name == 'from':
             sender = value
             logging.debug(f"Mensaje {msg_id} - Remitente: {sender}")
-            # Determinar Banco basado en remitente (ajustar si es necesario)
+            # --- Identificación del Banco ---
             if 'bbva.com' in sender.lower():
                 data['banco'] = 'BBVA'
-            # Añadir más 'elif' para otros bancos
+            elif 'naranjax.com' in sender.lower(): # NUEVO
+                data['banco'] = 'Naranja X'      # NUEVO
+            else:
+                 logging.warning(f"Mensaje {msg_id} - Banco no reconocido para remitente: {sender}")
+                 data['banco'] = 'Desconocido'
+        elif name == 'date':
+             # Extraer año del header Date
+             date_str = value
+             year_match = re.search(r'(\d{4})', date_str)
+             if year_match:
+                 email_year = year_match.group(1)
+                 logging.debug(f"Mensaje {msg_id} - Año extraído del header 'Date': {email_year}")
 
-    # --- Lógica MEJORADA para extraer Cuerpo del Texto ---
+    # Si no se pudo extraer el año, usar el actual como fallback
+    if not email_year:
+        logging.warning(f"Mensaje {msg_id} - No se pudo extraer el año del header 'Date'. Usando año actual como fallback.")
+        email_year = str(datetime.datetime.now().year)
+
+    # --- Lógica MEJORADA para extraer Cuerpo del Texto (Prioriza text/plain) ---
     parts = payload.get('parts', [])
-    body_data = None
+    plain_body_text = None
+    html_body_data = None # Guardará los datos crudos del HTML si se encuentra
+    found_plain_successfully = False
 
     if parts:
-        # Recorrer partes para encontrar text/plain o text/html
         logging.debug(f"Mensaje {msg_id} - Analizando {len(parts)} partes...")
-        part_stack = list(parts) # Usar una pila para búsqueda en profundidad (maneja multipart anidados)
-        found_plain = False
+        part_stack = list(parts)
 
         while part_stack:
-            part = part_stack.pop(0) # Procesar en orden (BFS-like)
+            part = part_stack.pop(0)
             part_mime_type = part.get('mimeType', '').lower()
             logging.debug(f"  - Analizando parte con MimeType: {part_mime_type}")
 
-            # Si es multipart, añadir sus sub-partes a la pila
             if 'multipart/' in part_mime_type:
                 sub_parts = part.get('parts', [])
                 if sub_parts:
                     logging.debug(f"    -> Encontrado multipart, añadiendo {len(sub_parts)} sub-partes.")
-                    part_stack.extend(sub_parts) # Añadir al final para procesar después de hermanos
-                continue # Pasar a la siguiente parte en la pila
+                    part_stack.extend(sub_parts)
+                continue
 
-            # Si encontramos text/plain, lo preferimos y paramos la búsqueda de texto
-            if part_mime_type == 'text/plain':
+            # Prioridad 1: text/plain
+            if part_mime_type == 'text/plain' and not found_plain_successfully: # Solo procesa el primero útil
                 body = part.get('body', {})
                 body_data = body.get('data')
                 if body_data:
                     logging.info(f"Mensaje {msg_id} - Encontrado text/plain. Intentando decodificar.")
-                    body_text = parse_email_body(body_data)
-                    if body_text:
-                        found_plain = True
-                        break # Salir del while, ya tenemos el texto plano
+                    decoded_plain = parse_email_body(body_data)
+                    if decoded_plain:
+                        plain_body_text = decoded_plain # Guardar texto plano decodificado
+                        found_plain_successfully = True
+                        logging.info(f"Mensaje {msg_id} - Decodificación text/plain EXITOSA.")
+                        # No rompemos el bucle, por si hay un HTML mejor formateado (poco probable, pero por completitud)
                     else:
                         logging.warning(f"Mensaje {msg_id} - Falló la decodificación del text/plain.")
-                        body_data = None # Resetear para posible fallback a HTML
                 else:
                      logging.warning(f"Mensaje {msg_id} - Parte text/plain no tiene 'data' en 'body'.")
 
-            # Si no hemos encontrado texto plano aún Y esta parte es text/html, la guardamos como fallback
-            elif not found_plain and part_mime_type == 'text/html':
-                body = part.get('body', {})
-                html_body_data = body.get('data')
-                if html_body_data:
-                     logging.debug(f"Mensaje {msg_id} - Encontrado text/html como fallback.")
-                     # Guardamos los datos crudos, solo decodificaremos si no encontramos plain text
-                     body_data = html_body_data # Sobreescribe body_data si era None o falló text/plain
-                else:
+            # Prioridad 2: text/html (guardar datos para fallback)
+            elif part_mime_type == 'text/html':
+                 body = part.get('body', {})
+                 html_body_data_candidate = body.get('data')
+                 if html_body_data_candidate:
+                     html_body_data = html_body_data_candidate # Guardar datos crudos del HTML
+                     logging.debug(f"Mensaje {msg_id} - Encontrado text/html (para posible fallback).")
+                 else:
                     logging.warning(f"Mensaje {msg_id} - Parte text/html no tiene 'data' en 'body'.")
 
-
-        # Si salimos del bucle y no encontramos texto plano, pero sí HTML, lo usamos
-        if not found_plain and body_data:
-             logging.info(f"Mensaje {msg_id} - No se encontró text/plain útil. Usando text/html como fallback.")
-             body_text_html = parse_email_body(body_data)
-             if body_text_html:
-                # ----- NUEVO: Convertir HTML a texto plano -----
-                try:
-                    logging.debug(f"Mensaje {msg_id} - Iniciando conversión de HTML a texto plano.")
-                    h = html2text.HTML2Text()
-                    # Puedes configurar opciones, ej: ignorar enlaces o imágenes si no son relevantes
-                    # h.ignore_links = True
-                    # h.ignore_images = True
-                    body_text = h.handle(body_text_html) # AQUÍ ocurre la conversión
-                    logging.info(f"Mensaje {msg_id} - Conversión HTML a texto plano EXITOSA.")
-                    logging.debug(f"--- INICIO TEXTO PLANO CONVERTIDO ({msg_id}) ---")
-                    logging.debug(body_text[:1000] + "...") # Loguear más caracteres del resultado
-                    logging.debug(f"--- FIN TEXTO PLANO CONVERTIDO ({msg_id}) ---")
-                except Exception as e_conv:
-                     logging.error(f"Mensaje {msg_id} - Error durante la conversión de HTML a texto: {e_conv}")
-                     body_text = None # Si la conversión falla, no podemos continuar
-                # ----- FIN NUEVO -----
-             else:
-                 logging.error(f"Mensaje {msg_id} - Falló la decodificación del text/html fallback.")
-                 body_text = None # Asegurarse de que body_text sea None si la decodificación falló
-
-
-    elif payload.get('body', {}).get('data'): # Para correos simples no multipart
-        logging.info(f"Mensaje {msg_id} - Correo simple (no multipart). Intentando decodificar body principal.")
-        body_data = payload.get('body', {}).get('data')
-        # Aunque sea simple, podría ser HTML
-        raw_body_text = parse_email_body(body_data)
-        if raw_body_text:
-             # Asumir que podría ser HTML y intentar convertir por si acaso
-             # (Si ya es texto plano, html2text usualmente lo maneja bien)
-             try:
-                logging.debug(f"Mensaje {msg_id} - Procesando body simple (podría ser HTML).")
+    # --- Decidir qué cuerpo usar ---
+    if found_plain_successfully:
+        logging.info(f"Mensaje {msg_id} - Usando contenido text/plain.")
+        body_text = plain_body_text
+        logging.debug(f"--- INICIO TEXTO PLANO ({msg_id}) ---")
+        logging.debug(body_text[:1000] + "...")
+        logging.debug(f"--- FIN TEXTO PLANO ({msg_id}) ---")
+    elif html_body_data:
+        logging.info(f"Mensaje {msg_id} - No se encontró/decodificó text/plain útil. Usando fallback text/html.")
+        body_text_html = parse_email_body(html_body_data)
+        if body_text_html:
+            try:
+                logging.debug(f"Mensaje {msg_id} - Iniciando conversión de HTML a texto plano.")
                 h = html2text.HTML2Text()
-                body_text = h.handle(raw_body_text)
-                logging.info(f"Mensaje {msg_id} - Procesamiento de body simple OK.")
-                logging.debug(f"--- INICIO TEXTO PLANO (simple) ({msg_id}) ---")
+                h.ignore_links = True # Ignorar enlaces puede limpiar el output
+                h.ignore_images = True # Ignorar imágenes
+                body_text = h.handle(body_text_html)
+                logging.info(f"Mensaje {msg_id} - Conversión HTML a texto plano EXITOSA.")
+                logging.debug(f"--- INICIO TEXTO PLANO CONVERTIDO ({msg_id}) ---")
                 logging.debug(body_text[:1000] + "...")
-                logging.debug(f"--- FIN TEXTO PLANO (simple) ({msg_id}) ---")
-             except Exception as e_conv_simple:
+                logging.debug(f"--- FIN TEXTO PLANO CONVERTIDO ({msg_id}) ---")
+            except Exception as e_conv:
+                 logging.error(f"Mensaje {msg_id} - Error durante la conversión de HTML a texto: {e_conv}")
+                 body_text = None
+        else:
+             logging.error(f"Mensaje {msg_id} - Falló la decodificación del text/html fallback.")
+             body_text = None
+    elif payload.get('body', {}).get('data'): # Correos simples (poco probable para estos bancos)
+        # ... (lógica similar para procesar body simple, intentar convertir a texto) ...
+        logging.warning(f"Mensaje {msg_id} - Procesando como correo simple (no multipart).")
+        raw_body_text = parse_email_body(payload.get('body', {}).get('data'))
+        if raw_body_text:
+            try:
+                h = html2text.HTML2Text()
+                h.ignore_links = True
+                h.ignore_images = True
+                body_text = h.handle(raw_body_text) # Intentar convertir por si es HTML
+            except Exception as e_conv_simple:
                 logging.error(f"Mensaje {msg_id} - Error procesando body simple: {e_conv_simple}")
                 body_text = None
-        else:
-            body_text = None
+        else: body_text = None
 
-    # --- FIN Lógica de extracción de cuerpo ---
 
+    # --- Fin Lógica de extracción de cuerpo ---
 
     if not body_text:
-        # Este log ahora se genera solo si NINGÚN método funcionó O LA CONVERSIÓN FALLÓ
         logging.error(f"Mensaje {msg_id} - No se pudo extraer/convertir NINGÚN cuerpo de texto útil. Asunto: {subject}")
         logging.debug(f"Estructura del payload para {msg_id}: {payload}")
         return None # No se pudo procesar
 
-    # --- EXTRACCIÓN CON EXPRESIONES REGULARES (Ajustadas para formato html2text) ---
+    # --- EXTRACCIÓN CON EXPRESIONES REGULARES (CONDICIONAL POR BANCO) ---
+    try:
+        if data['banco'] == 'Naranja X':
+            logging.info(f"Mensaje {msg_id} - Aplicando reglas de extracción para Naranja X.")
+            # Regex para Naranja X (aplicadas a body_text, que debería ser el text/plain)
 
-    # Busca "Fecha", luego cualquier espacio (incl. saltos línea), luego "| **", captura la fecha, y termina con "**"
-    fecha_match = re.search(
-        r"Fecha"                # Literal "Fecha"
-        r"\s+"                  # Uno o más espacios/saltos de línea
-        r"\|\s*\*\*"            # Literal "|", espacio opcional, literal "**" (escapados)
-        r"(\d{2}/\d{2}/\d{4})"  # Grupo 1: Captura la fecha DD/MM/AAAA
-        r"\*\*"                 # Literal "**" de cierre
-        , body_text, re.IGNORECASE | re.DOTALL) # DOTALL no es crucial aquí pero no daña
+            # Importe: Busca $ seguido de números con . y ,
+            importe_match = re.search(r"\$(\d[\d.,]+)", body_text)
+            # Comercio: Busca el importe, captura cualquier caracter (no goloso) hasta encontrar "Titular -"
+            comercio_match = re.search(
+                r"\$[\d.,]+"       # Encuentra el importe $17.000,00
+                r"\s*"             # Cero o más espacios/saltos de línea después
+                r"(.*?)"           # Grupo 1: Captura el nombre del comercio (no goloso)
+                r"\s+Titular\s+-"  # Detente cuando encuentres espacio(s), "Titular", espacio(s) y "-"
+                , body_text, re.DOTALL) # re.DOTALL permite a '.' incluir saltos de línea si los hubiera
 
-    # Busca "Comercio", espacio, "| **", captura cualquier caracter no goloso, y termina con "**"
-    comercio_match = re.search(
-        r"Comercio"             # Literal "Comercio"
-        r"\s+"                  # Uno o más espacios/saltos de línea
-        r"\|\s*\*\*"            # Literal "|", espacio opcional, literal "**"
-        r"(.*?)"                # Grupo 1: Captura el nombre del comercio (no goloso)
-        r"\*\*"                 # Literal "**" de cierre
-        , body_text, re.IGNORECASE | re.DOTALL)
+            if comercio_match:
+                data['comercio'] = comercio_match.group(1).strip() # Captura Grupo 1 y limpia espacios
+                logging.debug(f"Mensaje {msg_id} [NX] - Comercio encontrado: {data['comercio']}")
+            else:
+                # Si aún falla, podríamos intentar buscar entre el importe y "Tarjeta VISA" como último recurso
+                comercio_match_alt = re.search(r"\$[\d.,]+\s*(.*?)\s+Tarjeta\s+VISA", body_text, re.DOTALL)
+                if comercio_match_alt:
+                     data['comercio'] = comercio_match_alt.group(1).strip()
+                     logging.debug(f"Mensaje {msg_id} [NX] - Comercio encontrado (fallback Tarjeta): {data['comercio']}")
+                else:
+                    logging.warning(f"Mensaje {msg_id} [NX] - No se encontró el comercio (ni primario ni fallback).")
 
-    # Busca "Importe", espacio, "| **", captura moneda, espacio, captura monto, y termina con "**"
-    importe_match = re.search(
-        r"Importe"              # Literal "Importe"
-        r"\s+"                  # Uno o más espacios/saltos de línea
-        r"\|\s*\*\*"            # Literal "|", espacio opcional, literal "**"
-        r"(ARS|USD)\s*"         # Grupo 1: Captura moneda (ARS o USD) y espacio opcional
-        r"([\d.,]+)"            # Grupo 2: Captura el número (con puntos o comas)
-        r"\*\*"                 # Literal "**" de cierre
-        , body_text, re.IGNORECASE | re.DOTALL)
+            # Tarjeta: Busca "Tarjeta" seguido de VISA o MASTERCARD
+            tarjeta_match = re.search(r"Tarjeta\s+(VISA|MASTERCARD)", body_text, re.IGNORECASE)
+            # Fecha: Busca el patrón Día/MesAbbr
+            fecha_dia_mes_match = re.search(r"(\d{1,2})/([A-Z]{3})", body_text, re.IGNORECASE)
 
-    # --- Verificación y extracción de grupos (Asegúrate que los índices de grupo son correctos) ---
-    if fecha_match:
-        data['fecha'] = fecha_match.group(1) # Grupo 1 es la fecha
-        logging.debug(f"Mensaje {msg_id} - Fecha encontrada: {data['fecha']}")
-    else:
-        logging.warning(f"Mensaje {msg_id} - No se encontró la fecha.")
+            if importe_match:
+                importe_str = importe_match.group(1)
+                logging.debug(f"Mensaje {msg_id} [NX] - Importe encontrado (str): {importe_str}")
+                importe_str_limpio = importe_str.replace('.', '').replace(',', '.')
+                data['importe'] = float(importe_str_limpio)
+                # Asumir ARS si ve "PESOS" o si no especifica USD explícitamente
+                if "PESOS" in body_text.upper() or "USD" not in body_text.upper():
+                     data['moneda'] = 'ARS'
+                elif "USD" in body_text.upper(): # O buscar U$S?
+                    data['moneda'] = 'USD'
+                logging.debug(f"Mensaje {msg_id} [NX] - Importe (float): {data['importe']}, Moneda: {data['moneda']}")
+            else:
+                logging.warning(f"Mensaje {msg_id} [NX] - No se encontró el importe.")
 
-    if comercio_match:
-        data['comercio'] = comercio_match.group(1).strip() # Grupo 1 es el comercio
-        logging.debug(f"Mensaje {msg_id} - Comercio encontrado: {data['comercio']}")
-    else:
-        logging.warning(f"Mensaje {msg_id} - No se encontró el comercio.")
+            if tarjeta_match:
+                data['tarjeta'] = tarjeta_match.group(1).upper()
+                logging.debug(f"Mensaje {msg_id} [NX] - Tarjeta encontrada: {data['tarjeta']}")
+            else:
+                logging.warning(f"Mensaje {msg_id} [NX] - No se encontró el tipo de tarjeta.")
 
-    if importe_match:
-        data['moneda'] = importe_match.group(1).upper() # Grupo 1 es la moneda
-        importe_str = importe_match.group(2)           # Grupo 2 es el monto
-        logging.debug(f"Mensaje {msg_id} - Importe encontrado (str): {importe_str}, Moneda: {data['moneda']}")
-        # Limpieza del importe (sin cambios)
-        importe_str_limpio = importe_str.replace('.', '').replace(',', '.')
-        try:
-            data['importe'] = float(importe_str_limpio)
-            logging.debug(f"Mensaje {msg_id} - Importe (float): {data['importe']}")
-        except ValueError:
-            logging.error(f"Mensaje {msg_id} - No se pudo convertir el importe '{importe_str}' a número.")
-            data['importe'] = None # Asegurarse de que quede None si falla la conversión
-    else:
-         logging.warning(f"Mensaje {msg_id} - No se encontró el importe.")
-
-    # Extraer tipo de tarjeta (ej: del asunto)
-    if 'visa' in subject.lower():
-        data['tarjeta'] = 'VISA'
-    elif 'mastercard' in subject.lower(): # Añadir otras si es necesario
-        data['tarjeta'] = 'MASTERCARD'
-
-    if data['tarjeta']:
-         logging.debug(f"Mensaje {msg_id} - Tarjeta encontrada: {data['tarjeta']}")
-    else:
-         logging.warning(f"Mensaje {msg_id} - No se encontró el tipo de tarjeta en el asunto.")
+            if fecha_dia_mes_match:
+                 dia = fecha_dia_mes_match.group(1).zfill(2)
+                 mes_abbr = fecha_dia_mes_match.group(2).upper()
+                 mes_num = MESES_MAP.get(mes_abbr)
+                 if mes_num:
+                     data['fecha'] = f"{dia}/{mes_num}/{email_year}" # Usar año del header
+                     logging.debug(f"Mensaje {msg_id} [NX] - Fecha encontrada: {data['fecha']}")
+                 else:
+                     logging.warning(f"Mensaje {msg_id} [NX] - Abreviatura de mes no reconocida: {mes_abbr}")
+            else:
+                 logging.warning(f"Mensaje {msg_id} [NX] - No se encontró la fecha (Día/Mes).")
 
 
-    # Verificar si se extrajeron todos los datos necesarios
+        elif data['banco'] == 'BBVA':
+            logging.info(f"Mensaje {msg_id} - Aplicando reglas de extracción para BBVA.")
+            # Regex para BBVA (aplicadas a body_text, que debería ser el resultado de html2text)
+            # (Usar las regex que ya funcionaban para BBVA)
+            fecha_match = re.search(r"Fecha\s+\|\s*\*\*(.*?)\*\*", body_text, re.IGNORECASE | re.DOTALL) # Ajustada ligeramente
+            comercio_match = re.search(r"Comercio\s+\|\s*\*\*(.*?)\*\*", body_text, re.IGNORECASE | re.DOTALL) # Ajustada ligeramente
+            importe_match = re.search(r"Importe\s+\|\s*\*\*(ARS|USD)\s*([\d.,]+)\*\*", body_text, re.IGNORECASE | re.DOTALL) # Ajustada ligeramente
+
+            if fecha_match:
+                data['fecha'] = fecha_match.group(1).strip()
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Fecha encontrada: {data['fecha']}")
+            else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró la fecha.")
+
+            if comercio_match:
+                data['comercio'] = comercio_match.group(1).strip()
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Comercio encontrado: {data['comercio']}")
+            else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró el comercio.")
+
+            if importe_match:
+                data['moneda'] = importe_match.group(1).upper()
+                importe_str = importe_match.group(2).strip()
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe encontrado (str): {importe_str}, Moneda: {data['moneda']}")
+                importe_str_limpio = importe_str.replace('.', '').replace(',', '.')
+                data['importe'] = float(importe_str_limpio)
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe (float): {data['importe']}")
+            else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró el importe.")
+
+            # Tarjeta para BBVA (asumimos del asunto)
+            if 'visa' in subject.lower(): data['tarjeta'] = 'VISA'
+            elif 'mastercard' in subject.lower(): data['tarjeta'] = 'MASTERCARD'
+            if data['tarjeta']: logging.debug(f"Mensaje {msg_id} [BBVA] - Tarjeta encontrada (asunto): {data['tarjeta']}")
+            else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró tarjeta en asunto.")
+
+
+        else: # Banco desconocido o no configurado
+            logging.error(f"Mensaje {msg_id} - No hay reglas de extracción definidas para el banco: {data['banco']}")
+            return None
+
+    except Exception as e_regex:
+         logging.error(f"Mensaje {msg_id} - Error durante la aplicación de regex para banco {data['banco']}: {e_regex}", exc_info=True)
+         return None
+
+    # --- Verificación final de datos ---
     datos_faltantes = [k for k, v in data.items() if v is None and k != 'moneda'] # Moneda es opcional si no se guarda
     if datos_faltantes:
-        logging.error(f"Mensaje {msg_id} - Faltan datos al procesar correo: {datos_faltantes}. Asunto: {subject}. Datos extraídos: {data}")
-        logging.debug(f"--- INICIO CUERPO TEXTO ({msg_id}) ---")
-        logging.debug(body_text)
-        logging.debug(f"--- FIN CUERPO TEXTO ({msg_id}) ---")
-        # Aquí podrías llamar a una función para enviar notificación de error
-        # send_error_notification(subject, body_text, data)
+        logging.error(f"Mensaje {msg_id} - Faltan datos OBLIGATORIOS al procesar correo: {datos_faltantes}. Banco: {data['banco']}, Asunto: {subject}. Datos extraídos: {data}")
         return None # Indica que el parseo falló
 
     logging.info(f"Mensaje {msg_id} - Datos extraídos OK: {data}")
