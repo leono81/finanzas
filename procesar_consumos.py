@@ -35,34 +35,125 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%
 
 # --- FUNCIONES AUXILIARES ---
 
+import os
+import logging
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# --- Asegúrate de que estas constantes estén definidas globalmente ---
+TOKEN_FILE = 'token.json'
+CREDENTIALS_FILE = 'credentials.json'
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/spreadsheets']
+# ---
+
+
+
 def authenticate_google_apis():
-    """Autentica al usuario y retorna los objetos de servicio para Gmail y Sheets."""
+    """Autentica al usuario y retorna los objetos de servicio para Gmail y Sheets.
+       Usa flujo manual de consola si es necesario."""
     creds = None
+    # 1. Intenta cargar el token existente
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            logging.info(f"Token cargado desde {TOKEN_FILE}")
+        except Exception as e:
+            logging.warning(f"Error al cargar {TOKEN_FILE}: {e}. Se intentará re-autenticar.")
+            try:
+                os.remove(TOKEN_FILE)
+                logging.info(f"Archivo {TOKEN_FILE} corrupto eliminado.")
+            except OSError:
+                pass
+            creds = None
+
+    # 2. Si no hay credenciales o no son válidas, intentar refrescar o re-autenticar
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            logging.info("Credenciales expiradas, intentando refrescar...")
             try:
                 creds.refresh(Request())
+                logging.info("¡Token refrescado exitosamente!")
+                with open(TOKEN_FILE, 'w') as token:
+                    token.write(creds.to_json())
+                logging.info(f"Token refrescado guardado en {TOKEN_FILE}")
             except Exception as e:
-                logging.error(f"Error refrescando token: {e}. Necesita re-autorizar.")
-                # Si falla el refresh, forzamos la re-autorización eliminando token.json
-                if os.path.exists(TOKEN_FILE):
+                logging.error(f"Error al refrescar el token: {e}. Se requiere re-autenticación.")
+                try:
                     os.remove(TOKEN_FILE)
-                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-                creds = flow.run_local_server(port=0)
+                    logging.info(f"Archivo {TOKEN_FILE} inválido eliminado.")
+                except OSError:
+                    pass
+                creds = None
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
+            logging.info("No hay credenciales válidas o no se pueden refrescar. Iniciando flujo de autenticación manual por consola.")
+            creds = None
 
+    # 3. Si después de todo lo anterior no hay credenciales válidas, ejecutar flujo MANUAL de consola
+    if not creds:
+        try:
+            # --- Flujo Manual de Consola ---
+            logging.info("Iniciando flujo de autenticación manual...")
+            # Especificar redirect_uri para flujo manual OOB (out-of-band)
+            redirect_uri_oob = 'urn:ietf:wg:oauth:2.0:oob'
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_FILE,
+                SCOPES,
+                redirect_uri=redirect_uri_oob # <<< URI para flujo OOB
+            )
+
+            # Generar la URL de autorización
+            # access_type='offline' asegura que obtengamos un refresh_token
+            auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+
+            # Imprimir la URL para el usuario
+            print('=' * 80)
+            print('Por favor, visita esta URL en tu navegador local para autorizar esta aplicación:')
+            print(auth_url)
+            print('=' * 80)
+            print('Después de autorizar, copia el código proporcionado por Google.')
+            print("-" * 30)
+
+            # Pedir al usuario que pegue el código
+            code = input('Ingresa el código de autorización obtenido en el navegador y presiona Enter: ')
+            code = code.strip() # Quitar espacios extra
+            print("-" * 30)
+
+            # Intercambiar el código por tokens
+            logging.info("Código recibido, intercambiando por tokens...")
+            flow.fetch_token(code=code)
+            creds = flow.credentials # Obtener las credenciales del flujo
+            logging.info("¡Tokens obtenidos exitosamente!")
+
+            # Guardar las nuevas credenciales
+            with open(TOKEN_FILE, 'w') as token:
+                token.write(creds.to_json())
+            logging.info(f"Autenticación manual exitosa. Token guardado en {TOKEN_FILE}")
+
+        except FileNotFoundError:
+            logging.critical(f"ERROR CRÍTICO: No se encontró el archivo de credenciales '{CREDENTIALS_FILE}'. Descárgalo desde Google Cloud Console y colócalo en la misma carpeta que el script.")
+            return None, None
+        except Exception as e:
+            logging.error(f"Error durante el flujo de autenticación manual por consola: {e}", exc_info=True)
+            return None, None
+
+    # 4. Construir y devolver los servicios
     try:
+        if not creds: # Doble chequeo por si falló la autenticación manual
+             logging.error("No se pudieron obtener credenciales válidas.")
+             return None, None
+
         service_gmail = build('gmail', 'v1', credentials=creds)
         service_sheets = build('sheets', 'v4', credentials=creds)
+        logging.info("Servicios de Gmail y Sheets construidos exitosamente.")
         return service_gmail, service_sheets
     except HttpError as error:
         logging.error(f'Ocurrió un error al construir los servicios: {error}')
+        return None, None
+    except Exception as e:
+        logging.error(f'Error inesperado al construir servicios: {e}', exc_info=True)
         return None, None
 
 def get_or_create_label(service, user_id, label_name):
