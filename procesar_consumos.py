@@ -4,6 +4,7 @@ import re # Para expresiones regulares (extraer datos)
 import logging # Para registrar información y errores
 import html2text # Para convertir HTML a texto
 import datetime # Para obtener el año actual si falla la extracción del header
+import logging.handlers # <--- AÑADIR ESTE IMPORT
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -30,8 +31,40 @@ TOKEN_FILE = 'token.json'
 # Mapa de meses abreviados a números (para Naranja X)
 MESES_MAP = {'ENE': '01', 'FEB': '02', 'MAR': '03', 'ABR': '04', 'MAY': '05', 'JUN': '06', 'JUL': '07', 'AGO': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DIC': '12'}
 
-# Configuración de logging (cambiar a DEBUG para más detalle)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+# --- NUEVA CONFIGURACIÓN DE LOGS ---
+LOG_FILE_NAME = 'procesar_consumos.log' # Nombre del archivo de log
+LOG_RETENTION_DAYS = 14 # Número de días de logs a retener (ej: 14 para 2 semanas, 7 para 1 semana)
+# --- FIN NUEVA CONFIGURACIÓN DE LOGS ---
+
+# Configuración de logging (SE REEMPLAZARÁ/MODIFICARÁ LA SIGUIENTE LÍNEA)
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+
+# --- NUEVA CONFIGURACIÓN DETALLADA DE LOGGING ---
+logger = logging.getLogger() # Obtener el logger raíz
+logger.setLevel(logging.INFO) # Establecer el nivel mínimo de logging
+
+# Formateador para los logs
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+
+# Manejador para la consola (opcional, si aún quieres ver logs en la consola)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# Manejador para el archivo con rotación de tiempo
+# Rota diariamente ('D'), mantiene LOG_RETENTION_DAYS archivos de respaldo.
+# El archivo de log activo será LOG_FILE_NAME, los antiguos serán LOG_FILE_NAME.YYYY-MM-DD
+file_handler = logging.handlers.TimedRotatingFileHandler(
+    LOG_FILE_NAME,
+    when='D',           # 'D' para diario, 'H' para horario, 'W0'-'W6' para semanal (Lunes-Domingo), 'M' para minuto
+    interval=1,         # Intervalo para 'when'. 1 para diario significa cada 1 día.
+    backupCount=LOG_RETENTION_DAYS, # Número de archivos de respaldo a mantener
+    encoding='utf-8',   # Buena práctica especificar encoding
+    delay=False         # Si es True, la creación del archivo de log se pospone hasta la primera emisión
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+# --- FIN NUEVA CONFIGURACIÓN DETALLADA DE LOGGING ---
 
 # --- FUNCIONES AUXILIARES ---
 
