@@ -5,6 +5,7 @@ import logging # Para registrar información y errores
 import html2text # Para convertir HTML a texto
 import datetime # Para obtener el año actual si falla la extracción del header
 import logging.handlers # <--- AÑADIR ESTE IMPORT
+import os # <--- AÑADIR ESTE IMPORT
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -32,7 +33,16 @@ TOKEN_FILE = 'token.json'
 MESES_MAP = {'ENE': '01', 'FEB': '02', 'MAR': '03', 'ABR': '04', 'MAY': '05', 'JUN': '06', 'JUL': '07', 'AGO': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DIC': '12'}
 
 # --- NUEVA CONFIGURACIÓN DE LOGS ---
-LOG_FILE_NAME = 'procesar_consumos.log' # Nombre del archivo de log
+LOG_DIRECTORY = 'log' # Nombre de la subcarpeta para los logs
+LOG_FILE_NAME_ONLY = 'procesar_consumos.log' # Solo el nombre del archivo
+
+# Crear el directorio de logs si no existe
+if not os.path.exists(LOG_DIRECTORY):
+    os.makedirs(LOG_DIRECTORY)
+    print(f"Directorio de logs '{LOG_DIRECTORY}' creado.") # Loguear a consola ya que el logger aún no está full configurado
+
+LOG_FILE_PATH = os.path.join(LOG_DIRECTORY, LOG_FILE_NAME_ONLY) # Ruta completa al archivo de log
+
 LOG_RETENTION_DAYS = 14 # Número de días de logs a retener (ej: 14 para 2 semanas, 7 para 1 semana)
 # --- FIN NUEVA CONFIGURACIÓN DE LOGS ---
 
@@ -55,7 +65,7 @@ logger.addHandler(console_handler)
 # Rota diariamente ('D'), mantiene LOG_RETENTION_DAYS archivos de respaldo.
 # El archivo de log activo será LOG_FILE_NAME, los antiguos serán LOG_FILE_NAME.YYYY-MM-DD
 file_handler = logging.handlers.TimedRotatingFileHandler(
-    LOG_FILE_NAME,
+    LOG_FILE_PATH,
     when='D',           # 'D' para diario, 'H' para horario, 'W0'-'W6' para semanal (Lunes-Domingo), 'M' para minuto
     interval=1,         # Intervalo para 'when'. 1 para diario significa cada 1 día.
     backupCount=LOG_RETENTION_DAYS, # Número de archivos de respaldo a mantener
