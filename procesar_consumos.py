@@ -20,7 +20,7 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify', # Leer y modificar cor
 # https://docs.google.com/spreadsheets/d/19DMRr2n_Xc7YF_9nKzpNaobgKw_s4fGWhmfJCPzIYNo/edit
 SPREADSHEET_ID = '19DMRr2n_Xc7YF_9nKzpNaobgKw_s4fGWhmfJCPzIYNo'
 # Nombre de la hoja + rango donde añadir datos. 'A1' asume columnas Fecha, Banco, Comercio, Tarjeta, Importe
-SHEET_RANGE_NAME = 'Cuentas' 
+SHEET_RANGE_NAME = 'Data_Emails' 
 
 GMAIL_LABEL_TO_SEARCH = 'tarjetas-consumos-tarjeta' # Etiqueta de donde leer (formato para API/búsqueda)
 PROCESSED_LABEL_NAME = 'Procesado' # Etiqueta para marcar correos leídos
