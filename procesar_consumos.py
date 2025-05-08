@@ -13,6 +13,15 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# --- AÑADIR IMPORT DE NUESTRA CLASE Y DOTENV ---
+from exchange_rate_provider import ExchangeRateProvider
+from dotenv import load_dotenv # <--- NUEVO
+# --- FIN AÑADIR IMPORT ---
+
+# --- CARGAR VARIABLES DE ENTORNO DESDE .env (si existe) ---
+load_dotenv() # <--- NUEVO: Carga variables de .env al entorno
+# --- FIN CARGAR VARIABLES ---
+
 # --- CONFIGURACIÓN ---
 # Si modificas estos SCOPES, elimina el archivo token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify', # Leer y modificar correos
@@ -92,7 +101,9 @@ CREDENTIALS_FILE = 'credentials.json'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/spreadsheets']
 # ---
 
-
+# --- API KEY PARA CONVERSIÓN DE MONEDA (LEÍDA DE VARIABLES DE ENTORNO) ---
+EXCHANGERATE_API_KEY = os.environ.get('EXCHANGERATE_API_KEY')
+# --- FIN API KEY ---
 
 def authenticate_google_apis():
     """Autentica al usuario y retorna los objetos de servicio para Gmail y Sheets.
@@ -255,16 +266,20 @@ def parse_email_body(body_data):
         logging.error(f"Error inesperado en parse_email_body: {e}")
         return None
 
-def extract_data_from_email(message):
+def extract_data_from_email(message, exchange_provider):
     """Extrae la información relevante del objeto mensaje de Gmail."""
-    msg_id = message.get('id', 'N/A') # Obtener ID para logs
+    msg_id = message.get('id', 'N/A')
     logging.info(f"Procesando mensaje ID: {msg_id}")
 
-    data = {'fecha': None, 'banco': None, 'comercio': None, 'tarjeta': None, 'importe': None, 'moneda': None}
+    data = {
+        'fecha': None, 'banco': None, 'comercio': None, 'tarjeta': None,
+        'importe': None, 'moneda': None, # Estos serán el importe y moneda FINAL (convertidos si es necesario)
+        'importe_original': None, 'moneda_original': None, 'tasa_conversion': None # Nuevos campos
+    }
     subject = ''
     sender = ''
     body_text = ''
-    email_year = None # Para guardar el año extraído del header
+    email_year = None
 
     payload = message.get('payload', {})
     if not payload:
@@ -406,6 +421,9 @@ def extract_data_from_email(message):
 
     # --- EXTRACCIÓN CON EXPRESIONES REGULARES (CONDICIONAL POR BANCO) ---
     try:
+        # Variable para saber si los datos originales ya fueron poblados
+        original_data_populated = False
+
         if data['banco'] == 'Naranja X':
             logging.info(f"Mensaje {msg_id} - Aplicando reglas de extracción para Naranja X.")
             # Regex para Naranja X (aplicadas a body_text, que debería ser el text/plain)
@@ -439,15 +457,14 @@ def extract_data_from_email(message):
 
             if importe_match:
                 importe_str = importe_match.group(1)
-                logging.debug(f"Mensaje {msg_id} [NX] - Importe encontrado (str): {importe_str}")
                 importe_str_limpio = importe_str.replace('.', '').replace(',', '.')
-                data['importe'] = float(importe_str_limpio)
-                # Asumir ARS si ve "PESOS" o si no especifica USD explícitamente
+                data['importe_original'] = float(importe_str_limpio)
                 if "PESOS" in body_text.upper() or "USD" not in body_text.upper():
-                     data['moneda'] = 'ARS'
+                     data['moneda_original'] = 'ARS'
                 elif "USD" in body_text.upper(): # O buscar U$S?
-                    data['moneda'] = 'USD'
-                logging.debug(f"Mensaje {msg_id} [NX] - Importe (float): {data['importe']}, Moneda: {data['moneda']}")
+                    data['moneda_original'] = 'USD'
+                original_data_populated = True
+                logging.debug(f"Mensaje {msg_id} [NX] - Importe (float): {data['importe_original']}, Moneda: {data['moneda_original']}")
             else:
                 logging.warning(f"Mensaje {msg_id} [NX] - No se encontró el importe.")
 
@@ -489,12 +506,13 @@ def extract_data_from_email(message):
             else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró el comercio.")
 
             if importe_match:
-                data['moneda'] = importe_match.group(1).upper()
+                data['moneda_original'] = importe_match.group(1).upper()
                 importe_str = importe_match.group(2).strip()
-                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe encontrado (str): {importe_str}, Moneda: {data['moneda']}")
                 importe_str_limpio = importe_str.replace('.', '').replace(',', '.')
-                data['importe'] = float(importe_str_limpio)
-                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe (float): {data['importe']}")
+                data['importe_original'] = float(importe_str_limpio)
+                original_data_populated = True
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe encontrado (str): {importe_str}, Moneda: {data['moneda_original']}")
+                logging.debug(f"Mensaje {msg_id} [BBVA] - Importe (float): {data['importe_original']}")
             else: logging.warning(f"Mensaje {msg_id} [BBVA] - No se encontró el importe.")
 
             # Tarjeta para BBVA (asumimos del asunto)
@@ -507,16 +525,59 @@ def extract_data_from_email(message):
         else: # Banco desconocido o no configurado
             logging.error(f"Mensaje {msg_id} - No hay reglas de extracción definidas para el banco: {data['banco']}")
             return None
+        
+        # Asegurarse de que el importe y moneda finales se inicialicen desde los originales
+        # si la extracción fue exitosa (incluso si no hay conversión)
+        if original_data_populated:
+            data['importe'] = data['importe_original']
+            data['moneda'] = data['moneda_original']
+        else:
+            # Esto podría pasar si las regex de importe/moneda fallan para un banco conocido
+            logging.warning(f"Mensaje {msg_id} - No se pudo extraer importe/moneda original para banco {data['banco']}. No se puede proceder con la conversión.")
+            # Si no hay importe original, no podemos continuar con el resto de la lógica de datos.
+            # Se podría retornar None aquí si importe_original es crucial.
+            # Por ahora, dejaremos que la validación final lo capture si es necesario.
+
+        # --- LÓGICA DE CONVERSIÓN DE MONEDA --- 
+        if exchange_provider and data['moneda_original'] and data['moneda_original'] != 'ARS' and data['importe_original'] is not None:
+            logging.info(f"Mensaje {msg_id} - Moneda original es {data['moneda_original']}. Intentando convertir a ARS.")
+            # Por ahora, la clase ExchangeRateProvider está hardcodeada para USD -> ARS
+            # Si necesitaras otras conversiones (ej. EUR -> ARS), la clase necesitaría ser más flexible
+            # o tendrías múltiples instancias/métodos.
+            if data['moneda_original'] == exchange_provider.base_currency: # Generalmente 'USD'
+                tasa = exchange_provider.get_conversion_rate()
+                if tasa:
+                    data['tasa_conversion'] = tasa
+                    data['importe'] = round(data['importe_original'] * tasa, 2)
+                    data['moneda'] = exchange_provider.target_currency # Generalmente 'ARS'
+                    logging.info(f"Mensaje {msg_id} - Convertido {data['importe_original']} {data['moneda_original']} a {data['importe']} {data['moneda']} usando tasa {tasa}.")
+                else:
+                    logging.warning(f"Mensaje {msg_id} - No se pudo obtener tasa de conversión para {data['moneda_original']}. Se mantendrá el importe y moneda originales.")
+                    # Si falla la conversión, el importe y moneda ya están seteados a los originales antes de este bloque
+            else:
+                logging.warning(f"Mensaje {msg_id} - No hay lógica de conversión implementada para {data['moneda_original']} a ARS o la moneda base del proveedor no coincide. Se mantendrá el importe y moneda originales.")
+                # Si no es la moneda base del proveedor, no hacemos nada, ya están los originales.
+        elif data['moneda_original'] == 'ARS':
+            logging.info(f"Mensaje {msg_id} - La moneda ya es ARS. No se requiere conversión.")
+            # Los valores ya están correctos si la extracción fue exitosa.
+        # Si no hay exchange_provider, los valores originales se usan como finales.
+        # --- FIN LÓGICA DE CONVERSIÓN ---
 
     except Exception as e_regex:
-         logging.error(f"Mensaje {msg_id} - Error durante la aplicación de regex para banco {data['banco']}: {e_regex}", exc_info=True)
-         return None
+        logging.error(f"Mensaje {msg_id} - Error durante la aplicación de regex para banco {data['banco']}: {e_regex}", exc_info=True)
+        return None
 
     # --- Verificación final de datos ---
-    datos_faltantes = [k for k, v in data.items() if v is None and k != 'moneda'] # Moneda es opcional si no se guarda
+    datos_obligatorios = ['fecha', 'banco', 'comercio', 'tarjeta', 'importe', 'moneda']
+    # Si moneda_original existe y es diferente de moneda final, entonces tasa_conversion e importe_original deberían existir.
+    if data.get('moneda_original') and data.get('moneda_original') != data.get('moneda'):
+        datos_obligatorios.extend(['importe_original', 'moneda_original', 'tasa_conversion'])
+    
+    datos_faltantes = [k for k in datos_obligatorios if data.get(k) is None]
+
     if datos_faltantes:
-        logging.error(f"Mensaje {msg_id} - Faltan datos OBLIGATORIOS al procesar correo: {datos_faltantes}. Banco: {data['banco']}, Asunto: {subject}. Datos extraídos: {data}")
-        return None # Indica que el parseo falló
+        logging.error(f"Mensaje {msg_id} - Faltan datos OBLIGATORIOS ({datos_faltantes}) al procesar. Banco: {data['banco']}, Asunto: {subject}. Datos: {data}")
+        return None
 
     logging.info(f"Mensaje {msg_id} - Datos extraídos OK: {data}")
     return data
@@ -564,6 +625,15 @@ def main():
         logging.error("No se pudieron obtener los servicios de Google. Saliendo.")
         return
 
+    # --- INSTANCIAR ExchangeRateProvider ---    
+    exchange_provider = None # Inicializar a None
+    if EXCHANGERATE_API_KEY:
+        logging.info(f"API Key de ExchangeRate detectada. Inicializando proveedor de tasa de cambio.")
+        exchange_provider = ExchangeRateProvider(api_key=EXCHANGERATE_API_KEY)
+    else:
+        logging.warning("API Key de ExchangeRate (EXCHANGERATE_API_KEY) no configurada en el entorno o archivo .env. La conversión de moneda no funcionará.")
+    # --- FIN INSTANCIAR ---
+
     user_id = 'me'
     processed_label_id = get_or_create_label(service_gmail, user_id, PROCESSED_LABEL_NAME)
     if not processed_label_id:
@@ -589,7 +659,7 @@ def main():
                 message = service_gmail.users().messages().get(userId=user_id, id=msg_id, format='full').execute() # format='full' para headers y body
 
                 # Extraer los datos
-                extracted_data = extract_data_from_email(message)
+                extracted_data = extract_data_from_email(message, exchange_provider)
 
                 if extracted_data:
                     # Preparar fila para Google Sheets
@@ -600,7 +670,11 @@ def main():
                         extracted_data['banco'],
                         extracted_data['comercio'],
                         extracted_data['tarjeta'],
-                        extracted_data['importe'] # Ya es un float
+                        extracted_data['importe'],
+                        extracted_data['moneda'],
+                        extracted_data['importe_original'],
+                        extracted_data['moneda_original'],
+                        extracted_data['tasa_conversion']
                     ]
 
                     # Añadir a Google Sheets

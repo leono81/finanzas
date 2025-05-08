@@ -26,3 +26,24 @@ __pycache__/
 
 credentials.json
 token.json
+
+
+# Archivos de entorno
+.env
+
+# Tokens y credenciales sensibles
+token.json
+credentials.json 
+
+# Logs
+log/
+*.log
+
+# Directorios de Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+ENV/
+env/
